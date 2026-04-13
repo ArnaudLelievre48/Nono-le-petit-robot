@@ -41,12 +41,15 @@ memory = defaultdict(lambda: deque(maxlen=MAX_MEMORY))
 summary = defaultdict(str)
 current_model = DEFAULT_MODEL
 
+last_bot_messages = {}
+
+
 
 # ================= LATEX =================
 # pip install Pillow  (required for transparency post-processing)
 
 EQUATION_TEXT_COLOR = "#DCDDDE"   # Discord's default text colour
-EQUATION_PADDING_PT = 10          # padding in LaTeX points (standalone border)
+EQUATION_PADDING_PT = 5          # padding in LaTeX points (standalone border)
 EQUATION_PADDING_PX = 14          # padding in pixels (matplotlib fallback)
 BG_THRESHOLD = 15                 # pixels with R,G,B all below this are treated as background
 
@@ -82,19 +85,19 @@ LATEX_ENGINE, LATEX_CONVERTER = _detect_latex_backend()
 # ── regex ────────────────────────────────────────────────────────────────────
 # display ($$...$$) is listed first so it wins when both branches could match
 _MATH_RE = re.compile(
-    r'(\$\$)(.*?)(\$\$)'             # groups 1-3 : display math
-    r'|'
     r'(\$)(?!\$)(.*?)(?<!\$)(\$)',   # groups 4-6 : inline math
     re.DOTALL,
 )
 
+def clean_backticks(text: str) -> str:
+    return text.replace('`$', '$').replace('$`','$').replace(r'$$', r'$')
 
 def has_latex(text: str) -> bool:
     return bool(_MATH_RE.search(text))
 
-
 def parse_parts(text: str) -> list[tuple[str, str]]:
     """Return [(kind, content)] where kind ∈ {'text', 'inline', 'display'}."""
+    text = clean_backticks(text)
     parts = []
     pos = 0
     for m in _MATH_RE.finditer(text):
@@ -102,10 +105,7 @@ def parse_parts(text: str) -> list[tuple[str, str]]:
             chunk = text[pos:m.start()]
             if chunk:
                 parts.append(("text", chunk))
-        if m.group(1):                              # $$...$$
-            parts.append(("display", m.group(2).strip()))
-        else:                                       # $...$
-            parts.append(("inline", m.group(5).strip()))
+        parts.append(("inline", m.group(2).strip()))
         pos = m.end()
     if pos < len(text):
         tail = text[pos:]
@@ -348,6 +348,29 @@ def maybe_summarize(cid, model):
 
 
 # ================= MESSAGE UTILS =================
+async def tracked_send(channel, content=None, **kwargs):
+    msg = await channel.send(content, **kwargs)
+
+    cid = channel.id
+    if cid not in last_bot_messages:
+        last_bot_messages[cid] = []
+
+    last_bot_messages[cid].append(msg)
+    return msg
+
+
+async def clear_last_bot_messages(cid):
+    if cid not in last_bot_messages:
+        return
+
+    for msg in last_bot_messages[cid]:
+        try:
+            await msg.delete()
+        except:
+            pass
+
+    last_bot_messages[cid] = []
+
 def split_message(text, limit=2000):
     chunks = []
     while len(text) > limit:
@@ -372,10 +395,10 @@ async def send_response(channel, full_text, placeholder_msg=None):
         if placeholder_msg:
             await placeholder_msg.edit(content=chunks[0])
         else:
-            await channel.send(chunks[0])
+            await tracked_send(channel, chunks[0])
         prev = placeholder_msg
         for chunk in chunks[1:]:
-            prev = await channel.send(chunk)
+            prev = await tracked_send(channel, chunk)
         return
 
     # ── LaTeX path ───────────────────────────────────────────────────────
@@ -397,7 +420,7 @@ async def send_response(channel, full_text, placeholder_msg=None):
             stripped = text_buffer.strip()
             if stripped:
                 for chunk in split_message(stripped):
-                    await channel.send(chunk)
+                    await tracked_send(channel, chunk)
             text_buffer = ""
 
             # Render equation in thread pool (blocking I/O)
@@ -408,19 +431,71 @@ async def send_response(channel, full_text, placeholder_msg=None):
 
             if png:
                 label = "display" if is_display else "inline"
-                await channel.send(
-                    file=discord.File(png, filename=f"equation_{label}.png")
-                )
+                await tracked_send(channel, file=discord.File(png, filename=f"equation_{label}.png"))
             else:
                 # Fallback: monospace code block
+                print("RENDER ERROR")
                 delim = "$$" if is_display else "$"
-                await channel.send(f"`{delim}{content}{delim}`")
+                await tracked_send(channel, f"`{delim}{content}{delim}`")
 
     # Flush any trailing text
     stripped = text_buffer.strip()
     if stripped:
         for chunk in split_message(stripped):
-            await channel.send(chunk)
+            await tracked_send(channel, chunk)
+
+
+def render_full_latex(text: str) -> BytesIO | None:
+    """
+    Render the entire message as ONE LaTeX document image.
+    """
+    tmpdir = tempfile.mkdtemp()
+    try:
+        tex_file = os.path.join(tmpdir, "full.tex")
+        pdf_file = os.path.join(tmpdir, "full.pdf")
+
+        # Escape ONLY wrapping, keep math intact ($...$ works in LaTeX)
+        tex = (
+            f"\\documentclass[border={EQUATION_PADDING_PT}pt,varwidth]{{standalone}}\n"
+            "\\usepackage{amsmath,amssymb,amsfonts,mathtools}\n"
+            "\\usepackage{xcolor}\n"
+            f"\\pagecolor[HTML]{{000000}}\n"
+            f"\\color[HTML]{{{EQUATION_TEXT_COLOR.lstrip('#')}}}\n"
+            "\\begin{document}\n"
+            "\\raggedright\n"
+            f"{text}\n"
+            "\\end{document}\n"
+        )
+
+        with open(tex_file, "w") as f:
+            f.write(tex)
+
+        subprocess.run(
+            ["pdflatex", "-interaction=nonstopmode", "-output-directory", tmpdir, tex_file],
+            capture_output=True,
+            timeout=30,
+        )
+
+        if not os.path.exists(pdf_file):
+            return None
+
+        png_file = os.path.join(tmpdir, "out.png")
+
+        subprocess.run(
+            ["pdftoppm", "-png", "-singlefile", pdf_file, os.path.join(tmpdir, "out")],
+            capture_output=True,
+            timeout=15,
+        )
+
+        if not os.path.exists(png_file):
+            return None
+
+        with open(png_file, "rb") as f:
+            return BytesIO(f.read())
+
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
 
 
 # ================= DISCORD =================
@@ -472,7 +547,15 @@ async def on_message(message):
         return
 
     cid = message.channel.id
-    memory[cid].append(("user", message.content))
+
+    content_input = message.content
+    if message.attachments:
+        for attachment in message.attachments:
+            if attachment.filename.endswith(".txt"):
+                file_bytes = await attachment.read()
+                content_input += "\n\n" + file_bytes.decode("utf-8", errors="ignore")
+
+    memory[cid].append(("user", content_input))
     maybe_summarize(cid, current_model)
 
     messages = build_context(cid)
@@ -502,7 +585,23 @@ async def on_message(message):
     # ── final send (handles plain text and LaTeX) ─────────────────────────
     await send_response(message.channel, full, placeholder_msg=reply)
 
+    # when everything is done, replaces it with one beautiful LaTeX paragraph
+    if has_latex(full):
+        png = await asyncio.get_running_loop().run_in_executor(
+            None, render_full_latex, full.replace("\n", r" \\ "+"\n")
+        )
+        if png:
+            await clear_last_bot_messages(channel.id)
+            await message.channel.send(
+                file=discord.File(png, filename="full.png")
+            )
+        print("SHOULD BE RENDERED HERE")
+    else:
+        print("NO NEED TO RENDER ANYTHING")
+
+
     memory[cid].append(("assistant", full))
 
 
 bot.run(DISCORD_TOKEN)
+
