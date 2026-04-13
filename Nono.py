@@ -20,7 +20,7 @@ from PIL import Image
 BOT_TOKEN = ""
 try:
     with open("bot-token.txt","r") as bot_token:
-        BOT_TOKEN = bot_token.read()*
+        BOT_TOKEN = bot_token.read()
 except:
     pass
 
