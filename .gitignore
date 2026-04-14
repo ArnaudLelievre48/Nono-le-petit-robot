@@ -1,2 +1,5 @@
 bot-token.txt
 bot_memory.db
+bot_memory.db-shm
+bot_memory.db-wal
+nono/*

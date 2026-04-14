@@ -13,10 +13,13 @@ import sqlite3
 from io import BytesIO
 from collections import defaultdict
 from PIL import Image
+from pix2tex import cli as latex_ocr
 
 
 
 # ================= CONFIG =================
+model_latex = latex_ocr.LatexOCR()
+
 BOT_TOKEN = ""
 try:
     with open("bot-token.txt","r") as bot_token:
@@ -503,6 +506,19 @@ def render_full_latex(text: str) -> BytesIO | None:
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
+async def process_image_attachment(attachment):
+    if not attachment.filename.lower().endswith((".png", ".jpg", ".jpeg")):
+        return None
+
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+        await attachment.save(tmp.name)
+
+        img = Image.open(tmp.name)
+        latex_render = model_latex(img)
+
+    return latex_render
+
+
 
 # ================= DISCORD =================
 intents = discord.Intents.default()
@@ -568,6 +584,10 @@ async def on_message(message):
             if attachment.filename.endswith(".txt"):
                 file_bytes = await attachment.read()
                 content_input += "\n\n" + file_bytes.decode("utf-8", errors="ignore")
+            if attachment.filename.endswith((".png", ".jpeg", ".jpg")):
+                print("IMAGE DETECTED, TRANSLATING IT TO LaTeX USING PIX2TEX...")
+                text_img = await process_image_attachment(attachment)
+                content_input += "\n\n" + text_img
 
     mem_append(cid, "user", content_input)
     maybe_summarize(cid, current_model)
